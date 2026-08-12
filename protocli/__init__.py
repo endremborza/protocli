@@ -33,7 +33,7 @@ import types
 import typing
 from collections.abc import Callable
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 _SKIP = frozenset({"__main__", "__init__", "constants", "cli"})
 DISP_VAR = "_dispatcher"
