@@ -111,6 +111,16 @@ def test_unknown_command_exits(monkeypatch) -> None:
         _run(disp, "ghost", monkeypatch=monkeypatch)
 
 
+def test_unavailable_module_command(monkeypatch, capsys) -> None:
+    # A listed command whose module cannot import (missing optional dep or a
+    # module from an unmerged branch) fails cleanly, not with a traceback.
+    disp = Dispatcher("prog", {"soon": "not_yet_merged_module"})
+    with pytest.raises(SystemExit):
+        _run(disp, "soon", monkeypatch=monkeypatch)
+    assert "unavailable" in capsys.readouterr().err
+    assert disp.get_completions(["soon"]) == []
+
+
 def test_top_help_lists_commands(monkeypatch, capsys) -> None:
     def doer() -> None:
         """Does things."""

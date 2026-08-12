@@ -309,7 +309,11 @@ class Dispatcher:
             self._invoke(prog, target, rest, target.__doc__)
             return
 
-        mod = importlib.import_module(target)
+        try:
+            mod = importlib.import_module(target)
+        except ImportError as e:
+            print(f"command {cmd!r} is unavailable: {e}", file=sys.stderr)
+            raise SystemExit(1)
         child = getattr(mod, DISP_VAR, None)
         if child is not None:
             sys.argv = [prog, *rest]
@@ -327,7 +331,10 @@ class Dispatcher:
         target = self._commands[cmd]
         if callable(target):
             return _sig_completions(target, rest)
-        mod = importlib.import_module(target)
+        try:
+            mod = importlib.import_module(target)
+        except ImportError:
+            return []
         child = getattr(mod, DISP_VAR, None)
         if child is not None:
             return child.get_completions(rest)
