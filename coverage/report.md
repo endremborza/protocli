@@ -1,5 +1,5 @@
 | Name                               |    Stmts |     Miss |   Cover |
 |----------------------------------- | -------: | -------: | ------: |
-| protocli/\_\_init\_\_.py           |      242 |       55 |     77% |
-| protocli/tests/test\_dispatcher.py |       94 |        0 |    100% |
-| **TOTAL**                          |  **336** |   **55** | **84%** |
+| protocli/\_\_init\_\_.py           |      295 |       37 |     87% |
+| protocli/tests/test\_dispatcher.py |      148 |        0 |    100% |
+| **TOTAL**                          |  **443** |   **37** | **92%** |
