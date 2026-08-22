@@ -20,8 +20,16 @@ it. Signature → CLI shape:
 - ``*, m: Literal["a","b"]``   → ``--m`` restricted to choices
 - ``*, xs: list[float] = []``  → ``--xs 1.5,3.5`` (comma-separated; ``""`` → [];
                                   keyword-only, like bools)
+- ``Annotated[str, Complete(f)]`` → shell candidates from ``f()``, computed
+                                  only when completion is requested
 
 Argparse owns ``--help`` and error messages for signature-dispatched leaves.
+
+Completion resolves which parameter the cursor sits on — positionals included,
+variadics absorbing the tail — and offers that parameter's ``Literal`` choices
+or its ``Complete`` values. A ``Complete`` is advisory and never becomes
+argparse ``choices``: an unknown value reaches the function and is rejected
+there, with the function's own error rather than argparse's.
 """
 
 import argparse
@@ -31,7 +39,8 @@ import pkgutil
 import sys
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 __version__ = "0.1.1"
 
@@ -40,28 +49,67 @@ DISP_VAR = "_dispatcher"
 COMP_FUN = "get_completions"
 _HELP_FLAGS = (["-h"], ["--help"])
 
-# Sentinel a leaf's ``get_completions`` may return (as the sole candidate) to
-# request the shell's native pathname completion — handles ``~``, ``/``, ``$VAR``
-# and absolute/relative paths, which a static candidate list cannot. Recognised
-# by the ``_proto_complete`` bash function; keep the two literals in sync.
+# Sentinel requesting the shell's native pathname completion — it handles ``~``,
+# ``/``, ``$VAR`` and absolute/relative paths, which a static candidate list
+# cannot. Reached as ``Annotated[str, FILES]`` or returned by a leaf's
+# ``get_completions``, and valid only as the sole candidate. Recognised by the
+# ``_proto_complete`` bash function; keep the two literals in sync.
 FILE_COMPLETION = "\x1bFILES"
 
 
-def _unwrap_annotation(ann: object) -> tuple[object, list | None]:
-    """Return ``(base_type, choices_or_None)``.
+@dataclass(frozen=True)
+class Complete:
+    """Completion candidates for one parameter, carried in ``Annotated``.
 
-    Handles ``Literal[...]`` (returns element type + values as choices) and
-    ``Optional[T]``/``T | None`` (returns ``T``, no choices).
+    ``values`` is a sequence, or a zero-argument callable returning one. The
+    callable runs on the ``--complete`` path alone — never on dispatch, and
+    never under ``--help-all``, which walks every leaf in the tree.
+
+    Candidates never reach argparse as ``choices``; validating the value is
+    the target function's job. That is the whole difference from ``Literal``,
+    which fixes a closed set the parser can enforce, and the reason the two
+    are exclusive.
+
+    ``repeat`` re-offers values already given to a variadic positional.
+    """
+
+    values: Callable[[], Sequence[str]] | Sequence[str]
+    repeat: bool = False
+
+    def resolve(self) -> list[str]:
+        return list(self.values() if callable(self.values) else self.values)
+
+
+FILES = Complete((FILE_COMPLETION,))
+
+
+def _unwrap_annotation(ann: object) -> tuple[object, list | None, Complete | None]:
+    """Return ``(base_type, choices_or_None, completer_or_None)``.
+
+    Peels ``Annotated[...]`` (picking up a ``Complete``), ``Literal[...]``
+    (returns element type + values as choices) and ``Optional[T]``/``T | None``
+    (returns ``T``).
     """
     origin = typing.get_origin(ann)
     args = typing.get_args(ann)
+    if origin is typing.Annotated:
+        base, choices, completer = _unwrap_annotation(args[0])
+        for meta in args[1:]:
+            if isinstance(meta, Complete):
+                completer = meta
+        if choices is not None and completer is not None:
+            raise TypeError(
+                f"{ann}: Literal and Complete are exclusive — a Literal already"
+                " completes to its own choices"
+            )
+        return base, choices, completer
     if origin is typing.Literal:
-        return type(args[0]), list(args)
+        return type(args[0]), list(args), None
     if origin is typing.Union or origin is types.UnionType:
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1:
             return _unwrap_annotation(non_none[0])
-    return ann, None
+    return ann, None, None
 
 
 def _csv_of(elem: type) -> Callable[[str], list]:
@@ -76,12 +124,12 @@ def _csv_of(elem: type) -> Callable[[str], list]:
 def _build_parser(prog: str, fn: Callable) -> argparse.ArgumentParser:
     """Generate an argparse parser from ``fn``'s signature."""
     sig = inspect.signature(fn)
-    hints = typing.get_type_hints(fn)
+    hints = typing.get_type_hints(fn, include_extras=True)
     doc = (fn.__doc__ or "").strip().split("\n", 1)[0]
     parser = argparse.ArgumentParser(prog=prog, description=doc)
     for name, param in sig.parameters.items():
         raw_ann = hints.get(name, str)
-        ann, choices = _unwrap_annotation(raw_ann)
+        ann, choices, _ = _unwrap_annotation(raw_ann)
         kwargs: dict = {}
         if choices is not None:
             kwargs["choices"] = choices
@@ -127,30 +175,80 @@ def _sig_help(prog: str, fn: Callable) -> list[str] | None:
     return [_build_parser(prog, fn).format_help().rstrip()]
 
 
+def _flags_of(
+    sig: inspect.Signature, hints: dict
+) -> dict[str, tuple[inspect.Parameter, bool]]:
+    """``--flag`` → (param, whether it takes a value). Bools are ``store_true``."""
+    out = {}
+    for name, param in sig.parameters.items():
+        if param.kind is not inspect.Parameter.KEYWORD_ONLY:
+            continue
+        base, _, _ = _unwrap_annotation(hints.get(name, str))
+        out[f"--{name.replace('_', '-')}"] = (param, base is not bool)
+    return out
+
+
+def _cursor_param(
+    sig: inspect.Signature, flags: dict, rest: list[str]
+) -> tuple[inspect.Parameter | None, list[str], bool]:
+    """Resolve which parameter the shell is completing.
+
+    ``rest`` holds the tokens before the cursor (the partial word is the
+    shell's to filter). Returns the parameter, the positional tokens already
+    bound to it, and whether the cursor sits on a flag's value. The parameter
+    is ``None`` once every positional is filled and only flags remain.
+    """
+    bound: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        entry = flags.get(tok.split("=", 1)[0])
+        if entry is None:
+            bound.append(tok)
+            i += 1
+            continue
+        param, takes_value = entry
+        if takes_value and "=" not in tok:
+            if i + 1 == len(rest):
+                return param, bound, True
+            i += 2
+            continue
+        i += 1
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.KEYWORD_ONLY:
+            continue
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            return param, bound, False
+        if not bound:
+            return param, bound, False
+        bound = bound[1:]
+    return None, bound, False
+
+
 def _sig_completions(fn: Callable, rest: list[str]) -> list[str]:
     """Derive shell-completion candidates from ``fn``'s signature.
 
-    Returns the keyword-only flag names; if the previous token is a flag whose
-    annotation is ``Literal[...]``, returns those choices instead.
+    The parameter under the cursor contributes its ``Literal`` choices or its
+    ``Complete`` values; flags are legal wherever a positional is, so they are
+    appended — but not on a flag's own value, where nothing else is.
     """
     sig = inspect.signature(fn)
     if not sig.parameters:
         return []
-    hints = typing.get_type_hints(fn)
-    if rest:
-        last = rest[-1]
-        for name, param in sig.parameters.items():
-            if param.kind is not inspect.Parameter.KEYWORD_ONLY:
-                continue
-            if last != f"--{name.replace('_', '-')}":
-                continue
-            _, choices = _unwrap_annotation(hints.get(name, str))
-            return choices or []
-    return [
-        f"--{name.replace('_', '-')}"
-        for name, param in sig.parameters.items()
-        if param.kind is inspect.Parameter.KEYWORD_ONLY
-    ]
+    hints = typing.get_type_hints(fn, include_extras=True)
+    flags = _flags_of(sig, hints)
+    param, bound, on_value = _cursor_param(sig, flags, rest)
+    if param is None:
+        return list(flags)
+    _, choices, completer = _unwrap_annotation(hints.get(param.name, str))
+    values = completer.resolve() if completer is not None else list(choices or [])
+    if FILE_COMPLETION in values:
+        return [FILE_COMPLETION]
+    repeat = completer.repeat if completer is not None else False
+    if param.kind is inspect.Parameter.VAR_POSITIONAL and not repeat:
+        given = set(bound)
+        values = [v for v in values if v not in given]
+    return values if on_value else values + list(flags)
 
 
 class Dispatcher:

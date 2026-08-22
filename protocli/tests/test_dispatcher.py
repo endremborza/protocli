@@ -6,6 +6,8 @@ import pytest
 
 from protocli import (
     FILE_COMPLETION,
+    FILES,
+    Complete,
     Dispatcher,
     _build_parser,
     _unwrap_annotation,
@@ -13,10 +15,36 @@ from protocli import (
 
 
 def test_unwrap_annotation() -> None:
-    assert _unwrap_annotation(int) == (int, None)
-    assert _unwrap_annotation(typing.Literal["a", "b"]) == (str, ["a", "b"])
-    assert _unwrap_annotation(typing.Optional[int]) == (int, None)
-    assert _unwrap_annotation(str | None) == (str, None)
+    assert _unwrap_annotation(int) == (int, None, None)
+    assert _unwrap_annotation(typing.Literal["a", "b"]) == (str, ["a", "b"], None)
+    assert _unwrap_annotation(typing.Optional[int]) == (int, None, None)
+    assert _unwrap_annotation(str | None) == (str, None, None)
+
+    c = Complete(["a"])
+    assert _unwrap_annotation(typing.Annotated[int, c]) == (int, None, c)
+    assert _unwrap_annotation(typing.Optional[typing.Annotated[int, c]]) == (
+        int,
+        None,
+        c,
+    )
+    assert _unwrap_annotation(typing.Annotated[int, "unrelated"]) == (int, None, None)
+
+
+def test_literal_and_complete_are_exclusive() -> None:
+    def fn(
+        mode: typing.Annotated[typing.Literal["a", "b"], Complete(["c"])],
+    ) -> None: ...
+
+    with pytest.raises(TypeError, match="exclusive"):
+        _unwrap_annotation(typing.get_type_hints(fn, include_extras=True)["mode"])
+    with pytest.raises(TypeError, match="exclusive"):
+        _build_parser("prog", fn)
+
+
+def test_complete_never_constrains_the_parser() -> None:
+    def fn(name: typing.Annotated[str, Complete(["known"])]) -> None: ...
+
+    assert _build_parser("prog", fn).parse_args(["stranger"]).name == "stranger"
 
 
 def test_parser_shapes() -> None:
@@ -139,7 +167,98 @@ def test_completions() -> None:
     assert sorted(disp.get_completions(["cmd"])) == ["--mode", "--n"]
     assert disp.get_completions(["cmd", "--mode"]) == ["x", "y"]
     assert disp.get_completions(["ghost"]) == []
+    assert Dispatcher("prog", {"cmd": lambda: None}).get_completions(["cmd"]) == []
     assert FILE_COMPLETION.startswith("\x1b")
+
+
+def test_positional_completion() -> None:
+    def fn(
+        tool: typing.Annotated[str, Complete(lambda: ["ruff", "uv"])],
+        tag: str,
+        *,
+        force: bool = False,
+    ) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    assert disp.get_completions(["cmd"]) == ["ruff", "uv", "--force"]
+    # the second positional carries no candidates, but flags stay legal
+    assert disp.get_completions(["cmd", "ruff"]) == ["--force"]
+    assert disp.get_completions(["cmd", "ruff", "1.2"]) == ["--force"]
+    # a flag anywhere before the cursor does not consume a positional slot
+    assert disp.get_completions(["cmd", "--force"]) == ["ruff", "uv", "--force"]
+
+
+def test_literal_positional_completes() -> None:
+    def fn(mode: typing.Literal["fast", "slow"]) -> None: ...
+
+    assert Dispatcher("prog", {"cmd": fn}).get_completions(["cmd"]) == ["fast", "slow"]
+
+
+def test_variadic_absorbs_the_tail_and_dedups() -> None:
+    names = Complete(lambda: ["alpha", "beta"])
+
+    def fn(*machines: typing.Annotated[str, names], quiet: bool = False) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    assert disp.get_completions(["cmd"]) == ["alpha", "beta", "--quiet"]
+    assert disp.get_completions(["cmd", "alpha"]) == ["beta", "--quiet"]
+    assert disp.get_completions(["cmd", "alpha", "beta"]) == ["--quiet"]
+
+    def rep(*machines: typing.Annotated[str, Complete(names.values, repeat=True)]): ...
+
+    disp = Dispatcher("prog", {"cmd": rep})
+    assert disp.get_completions(["cmd", "alpha"]) == ["alpha", "beta"]
+
+
+def test_variadic_dedup_counts_only_its_own_tokens() -> None:
+    def fn(first: str, *rest: typing.Annotated[str, Complete(["a", "b"])]) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    assert disp.get_completions(["cmd", "a"]) == ["a", "b"]
+    assert disp.get_completions(["cmd", "a", "a"]) == ["b"]
+
+
+def test_flag_value_completion() -> None:
+    def fn(
+        *,
+        voice: typing.Annotated[str, Complete(["ana", "bo"])] = "ana",
+        speed: float = 1.0,
+        loud: bool = False,
+    ) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    flags = ["--voice", "--speed", "--loud"]
+    assert disp.get_completions(["cmd", "--voice"]) == ["ana", "bo"]
+    # a consumed flag value moves the cursor on; a store_true consumes nothing
+    assert disp.get_completions(["cmd", "--voice", "ana"]) == flags
+    assert disp.get_completions(["cmd", "--loud"]) == flags
+    assert disp.get_completions(["cmd", "--voice=ana"]) == flags
+    # a value-less flag with no candidates offers nothing rather than flags
+    assert disp.get_completions(["cmd", "--speed"]) == []
+
+
+def test_file_completion_stays_the_sole_candidate() -> None:
+    def fn(path: typing.Annotated[str, FILES], *, raw: bool = False) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    assert disp.get_completions(["cmd"]) == [FILE_COMPLETION]
+
+
+def test_completers_run_only_for_completion(monkeypatch) -> None:
+    calls = []
+
+    def machines() -> list[str]:
+        calls.append(1)
+        return ["alpha"]
+
+    def fn(name: typing.Annotated[str, Complete(machines)]) -> None: ...
+
+    disp = Dispatcher("prog", {"cmd": fn})
+    _run(disp, "cmd", "alpha", monkeypatch=monkeypatch)
+    _run(disp, "--help-all", monkeypatch=monkeypatch)
+    assert calls == []
+    assert disp.get_completions(["cmd"]) == ["alpha"]
+    assert calls == [1]
 
 
 def test_from_package(tmp_path, monkeypatch) -> None:
