@@ -42,7 +42,7 @@ import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 _SKIP = frozenset({"__main__", "__init__", "constants", "cli"})
 DISP_VAR = "_dispatcher"
